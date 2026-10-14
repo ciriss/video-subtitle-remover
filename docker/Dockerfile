@@ -14,21 +14,20 @@ ARG HARDWARD_ACCELERATOR="cuda"
 # 如果是 CUDA 12.x 版本，执行 CUDA 12.x 特定设置
 RUN --mount=type=cache,target=/root/.cache,sharing=private \
     if [ "${HARDWARD_ACCELERATOR}" = "cuda" ] && [ "${CUDA_VERSION}" != "11.8" ]; then \
-        pip install paddlepaddle==3.0 && \
         pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu$(echo ${CUDA_VERSION} | tr -d '.') && \
-        pip install -r /vsr/requirements.txt; \
+        pip install -r /vsr/requirements.txt && \
+        pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/; \
     fi
 
 # 如果是 CUDA 11.8 版本，执行 CUDA 11.8 特定设置
 RUN --mount=type=cache,target=/root/.cache,sharing=private \
 if [ "${HARDWARD_ACCELERATOR}" = "cuda" ] && [ "${CUDA_VERSION}" = "11.8" ]; then \
-    pip install paddlepaddle==3.0 && \
     pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu$(echo ${CUDA_VERSION} | tr -d '.') && \
     pip install -r /vsr/requirements.txt && \
     pip uninstall -y onnxruntime-gpu && \
     pip install onnxruntime-gpu==1.20.1 --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-11/pypi/simple/ && \
-    # for paddle
-    pip install setuptools==80.4.0; \
+    pip install setuptools==80.4.0 && \
+    pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/; \
 fi
 
 # 如果是 DirectML 版本，执行 DirectML 特定设置
