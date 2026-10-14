@@ -27,7 +27,7 @@ class STTNInpaint:
         self.model.load_state_dict(torch.load(model_path, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
         self.model.eval()
-        self._amp = enable_cuda_fast_math(self.device)
+        enable_cuda_fast_math(self.device)
         # 模型输入用的宽和高
         self.model_input_width, self.model_input_height = 640, 120
         # 2. 设置相连帧数
@@ -125,8 +125,7 @@ class STTNInpaint:
         # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
         comp_frames = [None] * frame_length
         # 重叠窗口先在 GPU 上做原来的 0.5 滑动平均，整段结束再拷回 CPU
-        amp = torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self._amp)
-        with torch.no_grad(), amp:
+        with torch.no_grad():
             # 将处理好的帧通过编码器，产生特征表示
             feats = self.model.encoder(feats.view(frame_length, 3, self.model_input_height, self.model_input_width))
             # 获取特征维度信息

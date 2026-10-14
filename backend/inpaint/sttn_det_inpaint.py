@@ -30,8 +30,8 @@ class STTNDetInpaint:
         self.model.load_state_dict(torch.load(model_path, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
         self.model.eval()
-        # autocast, not model.half(): attention fills scores with -1e9, which overflows fp16 weights
-        self._amp = enable_cuda_fast_math(self.device)
+        # fp16 autocast shifts the color of this checkpoint, so the forward stays fp32.
+        enable_cuda_fast_math(self.device)
         # 模型输入用的宽和高
         self.model_input_width, self.model_input_height = 432, 240
         # 2. 设置相连帧数
@@ -141,8 +141,7 @@ class STTNDetInpaint:
         # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
         comp_frames = [None] * frame_length
         # 重叠窗口先在 GPU 上做原来的 0.5 滑动平均，整段结束再拷回 CPU
-        amp = torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self._amp)
-        with torch.no_grad(), amp:
+        with torch.no_grad():
             # 将处理好的帧通过编码器，产生特征表示
             feats = self.model.encoder((feats*(1-masks_tensor).float()).view(frame_length, 3, self.model_input_height, self.model_input_width))
             # 获取特征维度信息
