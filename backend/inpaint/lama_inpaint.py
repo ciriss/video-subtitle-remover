@@ -1,12 +1,10 @@
-import os
-import gc
-from typing import Union, List
+import cv2
 import torch
 import numpy as np
+from typing import Union, List
 from PIL import Image
 from backend.inpaint.utils.lama_util import prepare_img_and_mask, get_image, pad_img_to_modulo
-from backend import config
-from backend.tools.inpaint_tools import get_inpaint_area_by_mask
+
 
 class LamaInpaint:
     def __init__(self, device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"), model_path='big-lama.pt') -> None:
@@ -33,8 +31,9 @@ class LamaInpaint:
             return [self.inpaint(images[0], masks[0])]
 
         orig_height, orig_width = images[0].shape[:2]
-        # 分小批次推理，每批最多 4 帧
-        mini_batch_size = 4
+        # 分小批次推理。小裁剪可以多帧一起跑，大图保持小批次。
+        budget = 512 * 512 * 4
+        mini_batch_size = max(1, min(8, budget // max(orig_height * orig_width, 1)))
         results = [None] * len(images)
         for start in range(0, len(images), mini_batch_size):
             end = min(start + mini_batch_size, len(images))
@@ -60,57 +59,88 @@ class LamaInpaint:
                 results[start + i] = batch_results[i][:orig_height, :orig_width]
 
             del img_tensor, mask_tensor, padded_imgs, padded_masks
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and orig_height * orig_width * mini_batch_size > budget:
                 torch.cuda.empty_cache()
 
         return results
 
+    def _prepare_crop(self, image: np.ndarray, mask: np.ndarray):
+        """Keep BGR. This checkpoint is called with OpenCV frames elsewhere in the repo."""
+        height, width = image.shape[:2]
+        long_side = max(height, width)
+        max_side = 768
+        if long_side > max_side:
+            scale = max_side / float(long_side)
+            resized = (max(8, int(round(width * scale))), max(8, int(round(height * scale))))
+            image = cv2.resize(image, resized, interpolation=cv2.INTER_AREA)
+            mask = cv2.resize(mask, resized, interpolation=cv2.INTER_NEAREST)
+        return image, mask
+
+    def _inpaint_crops(self, images: List[np.ndarray], mask: np.ndarray):
+        """Inpaint BGR crops that share one mask. Returns BGR at the original crop size."""
+        height, width = images[0].shape[:2]
+        prepared = [self._prepare_crop(image, mask) for image in images]
+        batch_images = [item[0] for item in prepared]
+        batch_masks = [item[1] for item in prepared]
+        preds = self._inpaint_batch(batch_images, batch_masks)
+        restored = []
+        for pred in preds:
+            if pred.shape[1] != width or pred.shape[0] != height:
+                pred = cv2.resize(pred, (width, height), interpolation=cv2.INTER_CUBIC)
+            restored.append(pred)
+        return restored
+
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
         """
-        :param input_frames: 原视频帧
-        :param input_mask: 字幕区域mask
+        Crop each subtitle island, inpaint that crop with LaMa, and write back
+        only the feathered mask. Pixels outside the mask stay the original frame.
         """
-        mask = input_mask[:, :, None]
-        H_ori, W_ori = mask.shape[:2]
-        H_ori = int(H_ori + 0.5)
-        W_ori = int(W_ori + 0.5)
-        # 确定去字幕的垂直高度部分
-        split_h = int(W_ori * 3 / 16)
-        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
-        # 高分辨率帧存储列表
-        frames_hr = [f.copy() for f in input_frames]
-        comps = {}  # 存放补全后帧的字典
-        # 存储最终的视频帧
-        inpainted_frames = []
+        if not input_frames:
+            return []
+        mask2d = input_mask[:, :, 0] if input_mask.ndim == 3 else input_mask
+        binary = (mask2d > 0).astype(np.uint8)
+        if not np.any(binary):
+            return list(input_frames)
 
-        for k in range(len(inpaint_area)):
-            # 收集该区域的所有裁剪帧和遮罩
-            cropped_frames = []
-            cropped_masks = []
-            for j in range(len(frames_hr)):
-                image_crop = frames_hr[j][inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], :, :]
-                cropped_frames.append(image_crop)
-                cropped_masks.append(mask_crop)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary * 255, connectivity=8)
+        components = []
+        for label in range(1, num_labels):
+            x, y, width, height, area = (int(v) for v in stats[label])
+            if area < 10 or width < 2 or height < 2:
+                continue
+            components.append((area, label, x, y, width, height))
+        if not components:
+            return list(input_frames)
 
-            # 批量推理
-            comps[k] = self._inpaint_batch(cropped_frames, cropped_masks)
-            del cropped_frames, cropped_masks
-            gc.collect()
-
-        # 如果存在去除部分
-        if inpaint_area:
-            for j in range(len(frames_hr)):
-                frame = frames_hr[j]
-                for k in range(len(inpaint_area)):
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = comps[k][j]
-                inpainted_frames.append(frame)
-        else:
-            # 无需处理的区域，返回原始帧
-            inpainted_frames = frames_hr
+        frames = [frame.copy() for frame in input_frames]
+        frame_h, frame_w = binary.shape[:2]
+        # Larger holes first so a later small box sees the finished neighbor as context.
+        for area, label, x, y, width, height in sorted(components, reverse=True):
+            pad = max(64, min(160, max(width, height)))
+            x0 = max(0, x - pad)
+            y0 = max(0, y - pad)
+            x1 = min(frame_w, x + width + pad)
+            y1 = min(frame_h, y + height + pad)
+            hole = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+            hole[labels[y0:y1, x0:x1] == label] = 255
+            if not np.any(hole):
+                continue
+            crops = [frame[y0:y1, x0:x1].copy() for frame in frames]
+            preds = self._inpaint_crops(crops, hole)
+            # Soft edge only. The interior of the box is the LaMa fill.
+            alpha = cv2.GaussianBlur(hole, (0, 0), 2.0).astype(np.float32) / 255.0
+            alpha = alpha[:, :, None]
+            print(
+                f"LaMa crop {x1 - x0}x{y1 - y0} at ({x0},{y0}) hole {width}x{height} frames={len(frames)}",
+                flush=True,
+            )
+            for index, pred in enumerate(preds):
+                region = frames[index][y0:y1, x0:x1]
+                if pred.shape[:2] != region.shape[:2]:
+                    pred = cv2.resize(pred, (region.shape[1], region.shape[0]), interpolation=cv2.INTER_CUBIC)
+                blended = pred.astype(np.float32) * alpha + region.astype(np.float32) * (1.0 - alpha)
+                frames[index][y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return inpainted_frames
-
-
+        return frames
