@@ -8,22 +8,15 @@ import cv2
 import torch
 import numpy as np
 from tqdm import tqdm
-from torchvision import transforms
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from backend.config import config
 from backend.inpaint.sttn.auto_sttn import InpaintGenerator
-from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
+from backend.inpaint.sttn.fast_infer import bgr_frames_to_tensor, enable_cuda_fast_math, windows_to_uint8
 from backend.tools.inpaint_tools import get_inpaint_area_by_mask, is_frame_number_in_ab_sections
 from backend.tools.video_io import FramePrefetcher
 from backend.tools.hardware_accelerator import HardwareAccelerator
-
-# 定义图像预处理方式
-_to_tensors = transforms.Compose([
-    Stack(),  # 将图像堆叠为序列
-    ToTorchFormatTensor()  # 将堆叠的图像转化为PyTorch张量
-])
 
 class STTNInpaint:
     def __init__(self, device, model_path):
@@ -34,6 +27,7 @@ class STTNInpaint:
         self.model.load_state_dict(torch.load(model_path, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
         self.model.eval()
+        self._amp = enable_cuda_fast_math(self.device)
         # 模型输入用的宽和高
         self.model_input_width, self.model_input_height = 640, 120
         # 2. 设置相连帧数
@@ -125,19 +119,21 @@ class STTNInpaint:
         """
         frame_length = len(frames)
         # 对帧进行预处理转换为张量，并进行归一化
-        feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
+        feats = bgr_frames_to_tensor(frames).unsqueeze(0) * 2 - 1
         # 把特征张量转移到指定的设备（CPU或GPU）
         feats = feats.to(self.device)
         # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
         comp_frames = [None] * frame_length
-        # 统一关闭梯度计算，用于推理阶段节省内存并加速
-        with torch.no_grad():
+        # 重叠窗口先在 GPU 上做原来的 0.5 滑动平均，整段结束再拷回 CPU
+        amp = torch.autocast(device_type="cuda", dtype=torch.float16, enabled=self._amp)
+        with torch.no_grad(), amp:
             # 将处理好的帧通过编码器，产生特征表示
             feats = self.model.encoder(feats.view(frame_length, 3, self.model_input_height, self.model_input_width))
             # 获取特征维度信息
             _, c, feat_h, feat_w = feats.size()
             # 调整特征形状以匹配模型的期望输入
             feats = feats.view(1, frame_length, c, feat_h, feat_w)
+            acc = [None] * frame_length
             # 在设定的邻居帧步幅内循环处理视频
             for f in range(0, frame_length, self.neighbor_stride):
                 # 计算邻近帧的ID
@@ -148,18 +144,14 @@ class STTNInpaint:
                 pred_feat = self.model.infer(feats[0, neighbor_ids + ref_ids, :, :, :])
                 # 将预测的特征通过解码器生成图片，并应用激活函数tanh
                 pred_img = torch.tanh(self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :]))
-                # 将结果张量重新缩放到0到255的范围内
-                pred_img = (pred_img + 1) / 2
-                # 将张量移动回CPU并转为NumPy数组
-                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
-                # 遍历邻近帧
-                for i in range(len(neighbor_ids)):
-                    idx = neighbor_ids[i]
-                    img = pred_img[i].astype(np.uint8)
-                    if comp_frames[idx] is None:
-                        comp_frames[idx] = img
-                    else:
-                        comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                # 将结果张量重新缩放到 0 到 1，混合用 fp32
+                pred_img = ((pred_img + 1) / 2).float()
+                for i, idx in enumerate(neighbor_ids):
+                    img = pred_img[i]
+                    acc[idx] = img if acc[idx] is None else acc[idx] * 0.5 + img * 0.5
+            pred_cpu = windows_to_uint8(acc)
+        for idx in range(frame_length):
+            comp_frames[idx] = pred_cpu[idx]
         # 返回处理完成的帧序列
         return comp_frames
 

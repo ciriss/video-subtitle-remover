@@ -159,9 +159,12 @@ cd <源码所在目录>
   - [Linux cuDNN 8.6.0 下载](https://developer.download.nvidia.cn/compute/redist/cudnn/v8.6.0/local_installers/11.8/cudnn-linux-x86_64-8.6.0.163_cuda11-archive.tar.xz)
   - 安装方法请参考 NVIDIA 官方文档。
 
-- 安装 PaddlePaddle GPU 版本（CUDA 11.8）：
+- 安装 PaddlePaddle GPU 版本。文本检测会用这块 GPU；只装了 CPU 版时自动退回 CPU。
   ```shell
-  pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+  # CUDA 12.6（40 系 / L4 / Ada，驱动 >= 550）
+  pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+  # CUDA 11.8
+  pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
   ```
 - 安装 Torch GPU 版本（CUDA 11.8）：
   ```shell

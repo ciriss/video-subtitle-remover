@@ -157,9 +157,12 @@ This project supports four running modes: CUDA (NVIDIA GPU acceleration), CPU (n
   - [Linux cuDNN 8.6.0 Download](https://developer.download.nvidia.cn/compute/redist/cudnn/v8.6.0/local_installers/11.8/cudnn-linux-x86_64-8.6.0.163_cuda11-archive.tar.xz)
   - Follow the installation guide in the NVIDIA official documentation.
 
-- Install PaddlePaddle GPU version (CUDA 11.8):
+- Install the PaddlePaddle GPU build. Text detection uses that GPU, and falls back to CPU when only the CPU build is installed.
   ```shell
-  pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+  # CUDA 12.6 (Ada / 40-series / L4, driver >= 550)
+  pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+  # CUDA 11.8
+  pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
   ```
 - Install Torch GPU version (CUDA 11.8):
   ```shell

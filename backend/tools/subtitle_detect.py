@@ -1,4 +1,6 @@
+import os
 import sys
+import time
 from functools import cached_property
 
 import cv2
@@ -20,6 +22,10 @@ class SubtitleDetect:
 
     # 采样间隔，根据视频帧率在 _init_sample_step 中自适应设置
     SAMPLE_STEP = 3
+    # PP-OCRv5 already resizes internally around this size. Larger frames are
+    # scaled here so the boxes can be mapped back, and a batch stays small.
+    DET_LONG_SIDE = 960
+    DET_BATCH = 8
 
     def __init__(self, video_path, sub_areas=[]):
         self.video_path = video_path
@@ -38,77 +44,198 @@ class SubtitleDetect:
         else:
             self.SAMPLE_STEP = 2
 
-    @cached_property
-    def text_detector(self):
+    def _det_device(self):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "gpu:0"
+        except Exception:
+            pass
+        return "cpu"
+
+    def _make_detector(self, device, enable_hpi):
+        # Set before the first paddle import. auto_growth leaves the rest of the card for STTN.
+        if str(device).startswith("gpu"):
+            os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
         import paddle
         paddle.disable_signal_handler()
         from paddleocr import TextDetection
-        hardware_accelerator = HardwareAccelerator.instance()
-        onnx_providers = hardware_accelerator.onnx_providers
         model_config = ModelConfig()
-        return TextDetection(
+        detector = TextDetection(
             model_name=model_config.DET_MODEL_NAME,
             model_dir=model_config.DET_MODEL_DIR,
-            device="cpu",
-            enable_hpi=len(onnx_providers) > 0,
+            device=device,
+            enable_hpi=enable_hpi,
         )
+        return detector, model_config.DET_MODEL_NAME
 
-    def detect_subtitle(self, img):
-        temp_list = []
-        results = self.text_detector.predict(img)
+    @cached_property
+    def text_detector(self):
+        hardware_accelerator = HardwareAccelerator.instance()
+        use_hpi = len(hardware_accelerator.onnx_providers) > 0
+        device = self._det_device()
+        try:
+            detector, name = self._make_detector(device, use_hpi)
+        except Exception as exc:
+            if device != "cpu" and use_hpi:
+                print(f"Subtitle detector HPI init failed ({exc}); retrying GPU without HPI", flush=True)
+                try:
+                    detector, name = self._make_detector(device, False)
+                except Exception as gpu_exc:
+                    print(f"Subtitle detector GPU init failed ({gpu_exc}); using CPU", flush=True)
+                    device = "cpu"
+                    detector, name = self._make_detector(device, False)
+            elif device != "cpu":
+                print(f"Subtitle detector GPU init failed ({exc}); using CPU", flush=True)
+                device = "cpu"
+                detector, name = self._make_detector(device, False)
+            else:
+                raise
+        self.det_device = device
+        print(f"Subtitle detector: {name} on {device}", flush=True)
+        return detector
+
+    def _resize_for_det(self, frame):
+        height, width = frame.shape[:2]
+        long_side = max(height, width)
+        if long_side <= self.DET_LONG_SIDE:
+            return frame, 1.0
+        scale = self.DET_LONG_SIDE / long_side
+        det = cv2.resize(
+            frame,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        return det, scale
+
+    def _boxes_from_result(self, res, scale, width, height):
+        dt_polys = res['dt_polys']
+        if dt_polys is None or len(dt_polys) == 0:
+            return []
+        coordinate_list = get_coordinates(dt_polys.tolist())
+        if not coordinate_list:
+            return []
+        if scale != 1.0:
+            inv = 1.0 / scale
+            scaled = []
+            for xmin, xmax, ymin, ymax in coordinate_list:
+                xmin = min(width - 1, max(0, int(round(xmin * inv))))
+                xmax = min(width, max(xmin + 1, int(round(xmax * inv))))
+                ymin = min(height - 1, max(0, int(round(ymin * inv))))
+                ymax = min(height, max(ymin + 1, int(round(ymax * inv))))
+                scaled.append((xmin, xmax, ymin, ymax))
+            coordinate_list = scaled
         sub_areas = self.sub_areas
         has_areas = sub_areas is not None and len(sub_areas) > 0
-        for res in results:
-            dt_polys = res['dt_polys']
-            if dt_polys is None or len(dt_polys) == 0:
-                continue
-            coordinate_list = get_coordinates(dt_polys.tolist())
-            if not coordinate_list:
-                continue
-            if not has_areas:
-                temp_list.extend(coordinate_list)
-            elif len(sub_areas) == 1:
-                # 单区域快速路径（最常见场景）
-                s_ymin, s_ymax, s_xmin, s_xmax = sub_areas[0]
-                for xmin, xmax, ymin, ymax in coordinate_list:
-                    if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                        temp_list.append((xmin, xmax, ymin, ymax))
-            else:
-                for xmin, xmax, ymin, ymax in coordinate_list:
-                    for s_ymin, s_ymax, s_xmin, s_xmax in sub_areas:
-                        if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
-                            temp_list.append((xmin, xmax, ymin, ymax))
-                            break
+        if not has_areas:
+            return coordinate_list
+        temp_list = []
+        if len(sub_areas) == 1:
+            s_ymin, s_ymax, s_xmin, s_xmax = sub_areas[0]
+            for xmin, xmax, ymin, ymax in coordinate_list:
+                if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
+                    temp_list.append((xmin, xmax, ymin, ymax))
+            return temp_list
+        for xmin, xmax, ymin, ymax in coordinate_list:
+            for s_ymin, s_ymax, s_xmin, s_xmax in sub_areas:
+                if s_xmin <= xmin and xmax <= s_xmax and s_ymin <= ymin and ymax <= s_ymax:
+                    temp_list.append((xmin, xmax, ymin, ymax))
+                    break
         return temp_list
 
+    def detect_subtitle(self, img):
+        height, width = img.shape[:2]
+        det_img, scale = self._resize_for_det(img)
+        boxes = []
+        for res in self.text_detector.predict(det_img):
+            boxes.extend(self._boxes_from_result(res, scale, width, height))
+        return boxes
+
+    def _detect_batch(self, frames):
+        if len(frames) == 1:
+            return [self.detect_subtitle(frames[0])]
+        prepared = []
+        det_frames = []
+        for frame in frames:
+            height, width = frame.shape[:2]
+            det_img, scale = self._resize_for_det(frame)
+            prepared.append((scale, width, height))
+            det_frames.append(det_img)
+        try:
+            results = self.text_detector.predict(det_frames, batch_size=len(det_frames))
+        except Exception as exc:
+            print(f"Batched text detection failed ({exc}); falling back to one frame", flush=True)
+            return [self.detect_subtitle(frame) for frame in frames]
+        if len(results) != len(frames):
+            return [self.detect_subtitle(frame) for frame in frames]
+        return [
+            self._boxes_from_result(res, scale, width, height)
+            for res, (scale, width, height) in zip(results, prepared)
+        ]
+
+    @staticmethod
+    def _release_det_cache():
+        try:
+            import paddle
+            if paddle.device.is_compiled_with_cuda():
+                paddle.device.cuda.empty_cache()
+        except Exception:
+            pass
+
     def find_subtitle_frame_no(self, sub_remover=None):
+        started = time.perf_counter()
         video_cap = cv2.VideoCapture(get_readable_path(self.video_path))
         frame_count = video_cap.get(cv2.CAP_PROP_FRAME_COUNT)
         tbar = tqdm(total=int(frame_count), unit='frame', position=0, file=sys.__stdout__, desc='Subtitle Finding')
         current_frame_no = 0
         # 阶段1：采样检测，仅对每隔 sample_step 帧执行 OCR
         sampled_results = {}  # frame_no -> temp_list
+        pending_frames = []
+        pending_nos = []
+        sampled = 0
+        ab_sections = None if sub_remover is None else sub_remover.ab_sections
+
+        def flush():
+            nonlocal sampled
+            if not pending_frames:
+                return
+            for frame_no, boxes in zip(pending_nos, self._detect_batch(pending_frames)):
+                if boxes:
+                    sampled_results[frame_no] = boxes
+            sampled += len(pending_frames)
+            pending_frames.clear()
+            pending_nos.clear()
+
         if sub_remover:
             sub_remover.append_output(tr['Main']['ProcessingStartFindingSubtitles'])
         while video_cap.isOpened():
-            ret, frame = video_cap.read()
-            # 如果读取视频帧失败（视频读到最后一帧）
+            # grab() skips the decode on frames that will not be OCR'd
+            sample = self.SAMPLE_STEP <= 1 or current_frame_no % self.SAMPLE_STEP == 0
+            in_section = is_frame_number_in_ab_sections(current_frame_no, ab_sections)
+            if sample and in_section:
+                ret, frame = video_cap.read()
+            else:
+                ret = video_cap.grab()
+                frame = None
             if not ret:
                 break
-            # 读取视频帧成功
             current_frame_no += 1
-            if not is_frame_number_in_ab_sections(current_frame_no - 1, sub_remover.ab_sections):
-                tbar.update(1)
-                continue
-            # 仅对采样帧执行 OCR 推理
-            if (current_frame_no - 1) % self.SAMPLE_STEP == 0 or self.SAMPLE_STEP <= 1:
-                temp_list = self.detect_subtitle(frame)
-                if len(temp_list) > 0:
-                    sampled_results[current_frame_no] = temp_list
+            if frame is not None:
+                pending_frames.append(frame)
+                pending_nos.append(current_frame_no)
+                if len(pending_frames) >= self.DET_BATCH:
+                    flush()
             tbar.update(1)
             if sub_remover:
                 sub_remover.progress_total = (100 * float(current_frame_no) / float(frame_count)) // 2
+        flush()
         video_cap.release()
+        print(
+            f"Subtitle detection finished in {time.perf_counter() - started:.1f}s, "
+            f"sampled {sampled} frames on {getattr(self, 'det_device', 'unknown')}",
+            flush=True,
+        )
+        self._release_det_cache()
         # 阶段2：插值填充 — 两个采样帧之间都有字幕时，中间帧也标记为有字幕
         subtitle_frame_no_box_dict = {}
         detected_nos = sorted(sampled_results.keys())
